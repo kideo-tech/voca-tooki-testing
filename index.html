@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en-us">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Voca Tooki">
+    <title>Unity WebGL Player | Voca Tooki</title>
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="apple-touch-icon" href="TemplateData/icon-192.png">
+    <link rel="shortcut icon" href="TemplateData/favicon.ico">
+    <link rel="preload" as="font" type="font/woff" href="TemplateData/fredoka-one.woff" crossorigin>
+    <link rel="preload" as="image" href="TemplateData/g-bg.webp">
+    <link rel="stylesheet" href="TemplateData/style.css">
+    <!-- Not needed until the game runs, so they must not hold up the loading screen.
+         Deferred scripts still run in this order, long before Unity calls into them. -->
+    <script defer src="https://ajax.googleapis.com/ajax/libs/jquery/3.1.0/jquery.min.js"></script>
+    <script defer src="unity-webview.js"></script>
+    <script defer src="libmp3lame.js"></script>
+  
+    <!-- MICROPHONE PRO START -->
+    <script defer src='./microphone.js'></script>
+    <!-- MICROPHONE PRO END -->
+<script defer src="https://unpkg.com/mic-recorder-to-mp3@2.2.1/dist/index.min.js"></script>
+
+</head>
+  <body>
+    <div id="unity-container" class="unity-desktop">
+      <canvas id="unity-canvas"></canvas>
+      <div id="unity-footer">
+        <div id="unity-webgl-logo"></div>
+        <div id="unity-fullscreen-button"></div>
+        <div id="unity-build-title">Voca Tooki</div>
+      </div>
+    </div>
+
+    <!-- Loading screen: stays up while Unity downloads and while the first screen's
+         Addressables download (Assets/Scripts/WebLoadingBridge.cs hides it). -->
+    <div id="vt-loader">
+      <div id="vt-stage">
+        <!-- The official lockup, cropped from Assets/Textures and Sprites/voca_tooki_splash_screen.png. -->
+        <h1 id="vt-title"><img src="TemplateData/vt-lockup.webp" alt="Voca Tooki, where languages come easy!"></h1>
+        <!-- A small runner to play while waiting (TemplateData/vt-game.js). -->
+        <div id="vt-game" aria-label="Mini game: tap or press Space to jump">
+          <canvas id="vt-game-canvas" width="640" height="300"></canvas>
+        </div>
+        <div id="vt-progress">
+          <div id="vt-status">Warming up…</div>
+          <div id="vt-bar"><div id="vt-bar-fill"></div><span id="vt-pct">0%</span></div>
+          <!-- Replaces the bar when the game is ready. -->
+          <button id="vt-go" type="button"><span class="vt-go-arrow">&#9654;</span> Let's go!</button>
+        </div>
+        <p id="vt-tip">Tap a word to hear how it sounds!</p>
+      </div>
+    </div>
+
+    <!-- Phones in portrait: the game is landscape-only. -->
+    <div id="vt-rotate">
+      <div class="vt-phone"><div class="vt-phone-screen"><img src="TemplateData/tooki-hi.webp" alt=""></div></div>
+      <p class="vt-rotate-text">Turn your phone sideways to play!</p>
+      <button id="vt-play" type="button">&#9654; Play</button>
+      <p id="vt-rotate-pct"></p>
+    </div>
+
+    <script>
+      var buildUrl = "Build";
+      var loaderUrl = buildUrl + "/84e53baf4af3795adb48087e957390fd.loader.js";
+      var config = {
+        dataUrl: buildUrl + "/54e7fc45f317ea96d51e7346888a74a2.data",
+        frameworkUrl: buildUrl + "/43b50ca541ad18de1208244091f9b915.framework.js",
+        codeUrl: buildUrl + "/2b8bb0c0bf8a5055054c0824b93dcb28.wasm",
+        streamingAssetsUrl: "StreamingAssets",
+        companyName: "Kideo Tech",
+        productName: "Voca Tooki",
+        productVersion: "5.0.0",
+      };
+
+      // The loading screen. Unity reports here in two phases: createUnityInstance progress
+      // (engine download), then the first screen's Addressables download through
+      // WebLoadingBridge.jslib (attach / sceneProgress / hide).
+      var vtLoader = (function () {
+        var ENGINE_SHARE = 0.6;           // part of the bar for the engine download
+        var DOWNLOAD_END = 0.9;           // the first screen's download fills the bar up to here
+        var BRIDGE_WAIT_MS = 2000;        // builds without the bridge hide once Unity is up
+        var MAX_SCENE_WAIT_MS = 120000;   // never cover the game for longer than this
+
+        var root = document.getElementById("vt-loader");
+        var fill = document.getElementById("vt-bar-fill");
+        var pctText = document.getElementById("vt-pct");
+        var rotatePct = document.getElementById("vt-rotate-pct");
+        var status = document.getElementById("vt-status");
+        var tip = document.getElementById("vt-tip");
+
+        var engineLines = ["Warming up…", "Waking up Tooki…", "Packing Tooki's backpack…", "Sharpening the pencils…"];
+        var sceneLines = ["Getting the islands ready…", "Hiding words to find…", "Polishing the treasure…"];
+        var openLines = ["Almost there!", "Unrolling the map…", "Tooki is landing…"];
+        var tips = [
+          "Tap a word to hear how it sounds!",
+          "Say the words out loud. Practice makes perfect!",
+          "Every island has new words to find.",
+          "Made a mistake? That's how we learn. Try again!",
+          "A little practice every day helps you remember.",
+          "Did you know? Parrots can learn words too, just like you!",
+          "Collect treasures as you learn new words."
+        ];
+
+        var target = 0, shown = 0, lastPct = -1;
+        var phase = 1, attached = false, sceneReported = false, hidden = false;
+        // Phase 2 creeps from creepFrom toward creepTo, so the bar never looks stuck: before Unity
+        // reports bytes, and again while the downloaded scene opens.
+        var creepFrom = ENGINE_SHARE, creepTo = DOWNLOAD_END, creepSince = 0, creepMs = 15000;
+        var lineIndex = 0, tipIndex = 0, timers = [];
+
+        function every(ms, fn) { timers.push(setInterval(fn, ms)); }
+        function swap(el, text) {
+          el.classList.add("vt-swap");
+          setTimeout(function () { el.textContent = text; el.classList.remove("vt-swap"); }, 300);
+        }
+        function raise(v) { target = Math.max(target, Math.min(v, 1)); }
+
+        function render(v) {
+          var pct = Math.floor(v * 100);
+          fill.style.width = (v * 100) + "%";
+          if (pct !== lastPct) { lastPct = pct; pctText.textContent = rotatePct.textContent = pct + "%"; }
+        }
+
+        function frame(now) {
+          if (hidden) return;
+          if (phase === 2 && (!sceneReported || creepTo > DOWNLOAD_END))
+            raise(creepFrom + (creepTo - creepFrom) * (1 - Math.exp(-(now - creepSince) / creepMs)));
+          shown += (target - shown) * 0.06;
+          render(shown);
+          requestAnimationFrame(frame);
+        }
+
+        every(3500, function () {
+          var lines = phase === 1 ? engineLines : creepTo > DOWNLOAD_END ? openLines : sceneLines;
+          lineIndex = (lineIndex + 1) % lines.length;
+          swap(status, lines[lineIndex]);
+        });
+        every(6000, function () { tipIndex = (tipIndex + 1) % tips.length; swap(tip, tips[tipIndex]); });
+        render(0);
+        requestAnimationFrame(frame);
+
+        // When Voca Tooki is ready the bar turns into a "Let's go" button and the loader waits for
+        // it, so nobody is pulled out of the mini-game, and the click lets the game start with
+        // sound (browsers only allow audio after a user gesture) and, on Android, fullscreen.
+        var offered = false;
+        function hide() {
+          if (hidden || offered) return;
+          offered = true;
+          timers.forEach(clearInterval);
+          raise(1);
+          swap(status, "Voca Tooki is ready!");
+          var go = document.getElementById("vt-go");
+          go.parentNode.classList.add("vt-go-show");
+          go.addEventListener("click", finish);
+          // the scene's first frames are still heavy; resume the mini-game once they're past
+          if (window.vtGame) setTimeout(function () { vtGame.pause(false); }, 1000);
+          document.addEventListener("keydown", function onEnter(e) {
+            if (e.code !== "Enter") return;
+            document.removeEventListener("keydown", onEnter);
+            finish();
+          });
+        }
+        function finish() {
+          if (hidden) return;
+          hidden = true;
+          if (window.vtGame) vtGame.stop();
+          timers.forEach(clearInterval);
+          render(1);
+          rotatePct.textContent = "";
+          root.classList.add("vt-done");
+          setTimeout(function () { root.style.display = "none"; }, 600);
+        }
+
+        return {
+          unityProgress: function (p) { raise(ENGINE_SHARE * p); },
+          unityReady: function () {
+            if (offered || hidden) return;
+            phase = 2;
+            creepSince = performance.now();
+            raise(ENGINE_SHARE);
+            lineIndex = -1;
+            swap(status, sceneLines[0]);
+            setTimeout(function () { if (!attached) hide(); }, BRIDGE_WAIT_MS);
+            setTimeout(hide, MAX_SCENE_WAIT_MS);
+          },
+          attach: function () { attached = true; },
+          sceneProgress: function (p) {
+            sceneReported = true;
+            raise(ENGINE_SHARE + (DOWNLOAD_END - ENGINE_SHARE) * p);
+            if (p >= 1 && creepTo === DOWNLOAD_END) {
+              creepFrom = target; creepTo = 0.99; creepSince = performance.now(); creepMs = 8000;
+              if (window.vtGame) vtGame.pause(true);   // Unity is about to open the scene
+              lineIndex = 0;
+              swap(status, openLines[0]);
+            }
+          },
+          hide: hide
+        };
+      })();
+
+    </script>
+    <script src="TemplateData/vt-game.js"></script>
+    <script>
+      var container = document.querySelector("#unity-container");
+      var gameInstance = null;
+
+      var canvas = document.querySelector("#unity-canvas");
+      var fullscreenButton = document.querySelector("#unity-fullscreen-button");
+      var width0 = "1366px";
+      var height0 = "768px";
+
+      var isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+      if (isMobile) {
+        container.className = "unity-mobile";
+        // Full phone resolution (3x) risks Safari memory reloads and slow frames, so cap at 2.
+        config.devicePixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+        // iPhone Safari has no fullscreen API, so it only gets "turn your phone sideways"
+        // (and "Add to Home Screen" for fullscreen). Android gets a Play button as well.
+        var canFullscreen = !!(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen);
+        document.documentElement.classList.add("vt-mobile", canFullscreen ? "vt-can-fullscreen" : "vt-no-fullscreen");
+        // Browsers only allow fullscreen from a user gesture, so enter it on the first tap
+        // (and again after the player leaves it). The whole page goes fullscreen, not the
+        // container, so web views and the file browser popup stay visible.
+        document.addEventListener("pointerup", function () {
+          var root = document.documentElement;
+          var request = root.requestFullscreen || root.webkitRequestFullscreen;
+          if (!request || document.fullscreenElement || document.webkitFullscreenElement) return;
+          Promise.resolve(request.call(root, { navigationUI: "hide" })).then(function () {
+            if (screen.orientation && screen.orientation.lock) return screen.orientation.lock("landscape");
+          }).catch(function () {});
+        }, true);
+        var onFullscreenChange = function () {
+          var on = !!(document.fullscreenElement || document.webkitFullscreenElement);
+          document.documentElement.classList.toggle("vt-fullscreen", on);
+        };
+        document.addEventListener("fullscreenchange", onFullscreenChange);
+        document.addEventListener("webkitfullscreenchange", onFullscreenChange);
+      } else {
+        canvas.style.width = "1366px";
+        canvas.style.height = "768px";
+      }
+
+      document.addEventListener(
+        'fullscreenchange',
+        function() {
+          if (isMobile) return; // the mobile layout already fills the screen through CSS
+          var p = document.getElementById('unity-container');
+          var c = document.getElementById('unity-canvas');
+          if (document.fullscreenElement) {
+            width0 = c.style.width;
+            height0 = c.style.height;
+            setTimeout(
+              function() {
+                c.style.width = getComputedStyle(p).width;
+                c.style.height = getComputedStyle(p).height;
+              },
+              250);
+          } else {
+            c.style.width = width0;
+            c.style.height = height0;
+          }
+        });
+      var script = document.createElement("script");
+      script.src = loaderUrl;
+      script.onload = () => {
+        createUnityInstance(canvas, config, (progress) => {
+          vtLoader.unityProgress(progress);
+        }).then((unityInstance) => {
+          gameInstance = unityInstance;
+
+          window.unityInstance = unityInstance;
+          vtLoader.unityReady();
+          fullscreenButton.onclick = () => {
+            var p = document.getElementById('unity-container');
+            var c = document.getElementById('unity-canvas');
+            c.requestFullscreen = () => {
+              p.requestFullscreen();
+            };
+            unityInstance.SetFullscreen(1);
+          };
+        }).catch((message) => {
+          alert(message);
+        });
+      };
+      document.body.appendChild(script);
+    </script>
+ 
+    <!-- BEGIN WEBGL FILE BROWSER LIB -->
+    <style>
+        #fb_popup_background.highlight {
+            border: 3px dashed #ccc;
+            border-radius: 26px;
+            border-color: aquamarine;
+        }
+    </style>
+
+    <div id="fileBrowserPopup" style="display: none; margin: -0.4%; position: absolute; width: 100%; height: 100%; left: 0; top: 0; bottom: 0; right: 0;">
+        <img src="FileBrowser/2x2.png" style="position: absolute; width: 100%; height: 100%;" />
+
+        <div id="fb_popup">
+            <img id="fb_popup_background" src="FileBrowser/popup_background.png" style="position: fixed; top: 0;  right: 0; bottom: 0; left: 0; margin: auto; width: 502.5px; height: 206px;" />
+            <div>
+                <img src="FileBrowser/popup_header.png" style="position: fixed; top: -146px;  right: 0; bottom: 0; left: 0; margin: auto; width: 502.5px; height: 60.5px;" />
+                <strong id="fb_popup_header_title" style="position: fixed; top: -110px;  right: -20px; bottom: 0; left: 0; margin: auto; width: 500px; height: 58px; color: black;">
+                    File Browser
+                </strong>
+            </div>
+            <div id="open_file_form">
+                <strong id="fb_popup_description_title" style="position: fixed; top: 0px;  right: 0px; bottom: 0; left: 0; margin: auto; width: 500px; height: 58px; text-align: center; color: black;">
+                    Select file to load or use drag & drop
+                </strong>
+
+                <label for="fileToUpload">
+                    <img src="FileBrowser/select_button.png" style="position: fixed; top: 0px;  right: 250px; bottom: -80px; left: 0; margin: auto; width: 193.5px; height: 41px;" />
+                    <strong id="fb_popup_select_button_title" style="position: fixed; top: 0px;  right: 250px; bottom: -100px; left: 0; margin: auto; width: 193.5px; height: 41px; text-align: center; color: black;">
+                        Select
+                    </strong>
+                </label>
+                <input type="File" name="fileToUpload" id="fileToUpload" style="width: 0px; height: 0px;" onchange="fbLoadFiles(event.target.files);return false;" />
+        
+                <label for="closePopup">
+                    <img src="FileBrowser/close_button.png" style="position: fixed; top: 0px;  right: -250px; bottom: -80px; left: 0; margin: auto; width: 193.5px; height: 41px;" />
+                    <strong id="fb_popup_close_button_title" style="position: fixed; top: 0px;  right: -245px; bottom: -100px; left: 0; margin: auto; width: 193.5px; height: 41px; text-align: center; color: black;">
+                        Close
+                    </strong>
+                </label>
+                <input type="button" name="closePopup" id="closePopup" style="width: 0px; height: 0px;" onclick="requestCloseFileBrowserForOpen()" />
+            </div>
+        </div>
+    </div>
+
+    <script type='text/javascript'>
+        // ************************ Drag and drop ***************** //
+        let dropArea = document.getElementById("fb_popup");
+        let dropAreaBG = document.getElementById("fb_popup_background");
+
+        // Prevent default drag behaviors
+        ;['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+            dropArea.addEventListener(eventName, preventDefaults, false);
+            document.body.addEventListener(eventName, preventDefaults, false);
+        })
+
+        // Highlight drop area when item is dragged over it
+        ;['dragenter', 'dragover'].forEach(eventName => {
+            dropArea.addEventListener(eventName, highlight, false);
+        })
+
+        ;['dragleave', 'drop'].forEach(eventName => {
+            dropArea.addEventListener(eventName, unhighlight, false);
+        })
+
+        // Handle dropped files
+        dropArea.addEventListener('drop', handleDrop, false);
+
+        function preventDefaults (e) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+
+        function highlight(e) {
+            dropAreaBG.classList.add('highlight');
+        }
+
+        function unhighlight(e) {
+            dropAreaBG.classList.remove('highlight');
+        }
+
+        function handleDrop(e) {
+            var dt = e.dataTransfer;
+            var files = dt.files;
+
+            fbLoadFiles(files)
+        }
+    </script>
+
+    <script type='text/javascript'>
+        function callFBFunctionByName(functionName, parameter){
+            switch(functionName){
+                case "initializeFBLibrary":
+                    initializeFBLibrary();
+                    break;
+                case "openFileBrowserForLoad":
+                    openFileBrowserForLoad(parameter);
+                    break;
+                case "cleanupFB":
+                    cleanupFB();
+                    break;       
+                case "closeFileBrowserForOpen":
+                    closeFileBrowserForOpen();
+                    break;
+                case "saveFile":
+                    saveFileFB(parameter);
+                    break;
+				case "saveFile2":
+                    saveFileFB2(parameter);
+                    break;
+                case "setLocalization":
+                    setLocalizationFB(parameter);
+                    break;
+            }
+        }
+        document.callFBFunctionByName = callFBFunctionByName;
+
+        function initializeFBLibrary(){
+            document.fbPopup = document.getElementById("fileBrowserPopup");
+            document.fbOpenFilePopupInput = document.getElementById("fileToUpload");
+
+            document.fbStorage = { 
+                initialized: true,
+                loadedFiles: {},
+                dataPointers: []
+            };
+        }
+
+        function openFileBrowserForLoad(typesFilter){
+            if(document.fbStorage.initialized !== true)
+                return;
+            document.fbOpenFilePopupInput.accept = typesFilter;
+		    document.fbPopup.style.display = "flex";
+        }
+
+        function closeFileBrowserForOpen(){
+            if(document.fbStorage.initialized !== true)
+                return;
+            document.fbPopup.style.display = "none";
+        }
+
+        function cleanupFB() {
+            if(document.fbStorage.initialized !== true)
+                return;
+            document.fbStorage.loadedFiles = {};
+            document.fbStorage.dataPointers = [];
+        }
+
+        function saveFileFB(fileData){
+            if(document.fbStorage.initialized !== true)
+                return;
+
+            let fileInfo = {
+                status: true,
+                message: "",
+                name: fileData.name
+            };
+
+            try{
+                var contentType = 'application/octet-stream';
+                var a = document.createElement('a');
+                var blob = new Blob([fbBase64ToBytesArray(fileData.data)], {
+                    'type': contentType
+                });
+                a.href = window.URL.createObjectURL(blob);
+                a.download = fileData.name;
+
+                if (document.createEvent) {
+                    var event = document.createEvent('MouseEvents');
+                    event.initEvent('click', true, true);
+                    a.dispatchEvent(event);
+                } else {
+                    a.click();
+                }
+
+                gameInstance.SendMessage(libraryHandlerObjectName, "HandleFileSaved", JSON.stringify(fileInfo));
+            }
+            catch(ex){
+                fileInfo.status = false;
+                fileInfo.message = ex.message;
+
+                gameInstance.SendMessage(libraryHandlerObjectName, "HandleFileSaved", JSON.stringify(fileInfo));
+            }
+        }
+		
+		 function saveFileFB2(blobPath){
+            if(document.fbStorage.initialized !== true)
+                return;
+            gameInstance.SendMessage(libraryHandlerObjectName, "HandleFileSaved2", JSON.stringify(blobPath));
+        }
+
+        const libraryHandlerObjectName = "[FGFileBrowser]";
+
+        function fbLoadFiles(files) {
+            for (var i = 0, f; f = files[i]; i++) {
+                var reader = new FileReader();
+                reader.onload = (function (file) {
+                    return function (fileloadEvent) {
+                        let loadedFileInfo = fileloadEvent.target.result;
+                
+                        document.fbStorage.loadedFiles[file.name] = {
+                            info: loadedFileInfo
+                        };
+
+                        let extensionSplit = file.name.split('.');
+                        let extension = extensionSplit[extensionSplit.length - 1];
+                        let name = file.name.replace(extension, "");
+                        name = name.substring(0, name.length - 1);
+
+                        let loadedFile = {
+                            fullName: file.name,
+                            name: name,
+                            path: URL.createObjectURL(file),
+                            length: loadedFileInfo.byteLength,
+                            size: file.size,
+                            extension: extension
+                        };
+
+                        gameInstance.SendMessage(libraryHandlerObjectName, 'HandleLoadedFile', JSON.stringify(loadedFile));
+                    }
+                })(f);
+                
+                reader.readAsArrayBuffer(f);
+            }
+			document.fbOpenFilePopupInput.value = "";
+        }
+
+        function requestCloseFileBrowserForOpen() {
+            gameInstance.SendMessage(libraryHandlerObjectName, "CloseFileBrowserForOpen");
+        }
+
+        function fbBase64ToBytesArray(base64) {
+            var binary_string = window.atob(base64);
+            var len = binary_string.length;
+            var bytes = new Uint8Array(len);
+            for (var i = 0; i < len; i++) {
+                bytes[i] = binary_string.charCodeAt(i);
+            }
+            return bytes.buffer;
+        }
+
+        function setLocalizationFB(parameter){
+            switch(parameter.key){
+                case "HEADER_TITLE":
+                    document.getElementById("fb_popup_header_title").innerHTML = parameter.value;
+                    break;
+                case "DESCRIPTION_TEXT":
+                    document.getElementById("fb_popup_description_title").innerHTML = parameter.value;
+                    break;
+                case "SELECT_BUTTON_CONTENT":
+                    document.getElementById("fb_popup_select_button_title").innerHTML = parameter.value;
+                    break;
+                case "CLOSE_BUTTON_CONTENT":
+                    document.getElementById("fb_popup_close_button_title").innerHTML = parameter.value;
+                    break;
+            }
+        }
+
+    </script>
+    <!-- END WEBGL FILE BROWSER LIB -->
+ </body>
+</html>
