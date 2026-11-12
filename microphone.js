@@ -127,11 +127,14 @@ class Microphone {
     }
     async refreshDevices() {
         if (navigator.mediaDevices?.enumerateDevices) {
-            if (!this.mediaAvailable)
+            // Opening the mic only reveals the device labels, so skip it once they are known (the permission
+            // is already granted), and stop the stream at once: an open stream keeps the mic busy, which
+            // leaves the browser's speech recognition hearing silence on Android.
+            if (!this.mediaAvailable && !this.devicePermitted(this.deviceKinds.AudioInput))
                 try {
-                    await navigator.mediaDevices.getUserMedia({
+                    (await navigator.mediaDevices.getUserMedia({
                         audio: !0
-                    })
+                    })).getTracks().forEach(t => t.stop())
                 } catch (e) {
                     this.devicesList = [];
                     return
